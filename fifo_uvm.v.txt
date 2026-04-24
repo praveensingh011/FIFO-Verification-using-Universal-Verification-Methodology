@@ -1,0 +1,267 @@
+// DUT Interface
+interface fifo_if #(parameter DATA_WIDTH = 8)(input logic clk);
+
+    logic rst;
+    logic wr_en;
+    logic rd_en;
+    logic [DATA_WIDTH-1:0] din;
+    logic [DATA_WIDTH-1:0] dout;
+    logic full;
+    logic empty;
+
+endinterface
+
+// Transaction Class
+class fifo_item extends uvm_sequence_item;
+
+    `uvm_object_utils(fifo_item)
+
+    rand bit wr_en;
+    rand bit rd_en;
+    rand bit [7:0] din;
+
+    bit [7:0] dout;
+
+    function new(string name = "fifo_item");
+        super.new(name);
+    endfunction
+
+    function string convert2string();
+        return $sformatf("wr_en=%0b rd_en=%0b din=%0d dout=%0d",
+                          wr_en, rd_en, din, dout);
+    endfunction
+
+endclass
+
+// Sequence
+class fifo_sequence extends uvm_sequence #(fifo_item);
+
+    `uvm_object_utils(fifo_sequence)
+
+    function new(string name="fifo_sequence");
+        super.new(name);
+    endfunction
+
+    task body();
+        fifo_item item;
+
+        repeat (20) begin
+            item = fifo_item::type_id::create("item");
+            start_item(item);
+
+            assert(item.randomize() with {
+                wr_en dist {1:=70, 0:=30};
+                rd_en dist {1:=70, 0:=30};
+            });
+
+            finish_item(item);
+        end
+    endtask
+
+endclass
+
+// Driver
+class fifo_driver extends uvm_driver #(fifo_item);
+
+    `uvm_component_utils(fifo_driver)
+
+    virtual fifo_if vif;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        if (!uvm_config_db#(virtual fifo_if)::get(this, "", "vif", vif))
+            `uvm_fatal("DRV", "Virtual interface not set")
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        fifo_item item;
+
+        forever begin
+            seq_item_port.get_next_item(item);
+
+            vif.wr_en = item.wr_en;
+            vif.rd_en = item.rd_en;
+            vif.din   = item.din;
+
+            @(posedge vif.clk);
+
+            seq_item_port.item_done();
+        end
+    endtask
+
+endclass
+
+//Monitor
+class fifo_monitor extends uvm_component;
+
+    `uvm_component_utils(fifo_monitor)
+
+    virtual fifo_if vif;
+    uvm_analysis_port #(fifo_item) ap;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+        ap = new("ap", this);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        uvm_config_db#(virtual fifo_if)::get(this, "", "vif", vif);
+    endfunction
+
+    task run_phase(uvm_phase phase);
+        fifo_item item;
+
+        forever begin
+            @(posedge vif.clk);
+
+            item = fifo_item::type_id::create("item");
+            item.wr_en = vif.wr_en;
+            item.rd_en = vif.rd_en;
+            item.din   = vif.din;
+            item.dout  = vif.dout;
+
+            ap.write(item);
+        end
+    endtask
+
+endclass
+
+//Scoreboard
+class fifo_scoreboard extends uvm_component;
+
+    `uvm_component_utils(fifo_scoreboard)
+
+    uvm_analysis_imp #(fifo_item, fifo_scoreboard) imp;
+
+    bit [7:0] ref_queue[$];
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+        imp = new("imp", this);
+    endfunction
+
+    function void write(fifo_item item);
+
+        if (item.wr_en)
+            ref_queue.push_back(item.din);
+
+        if (item.rd_en) begin
+            if (ref_queue.size() == 0)
+                `uvm_error("SCOREBOARD", "Read from empty FIFO")
+            else begin
+                bit [7:0] exp = ref_queue.pop_front();
+
+                if (exp != item.dout)
+                    `uvm_error("SCOREBOARD",
+                        $sformatf("Mismatch exp=%0d got=%0d", exp, item.dout))
+                else
+                    `uvm_info("SCOREBOARD",
+                        $sformatf("Match exp=%0d", exp), UVM_MEDIUM)
+            end
+        end
+
+    endfunction
+
+endclass
+
+//Agent
+class fifo_agent extends uvm_component;
+
+    `uvm_component_utils(fifo_agent)
+
+    uvm_sequencer #(fifo_item) sequencer;
+    fifo_driver driver;
+    fifo_monitor monitor;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        sequencer = uvm_sequencer#(fifo_item)::type_id::create("sequencer", this);
+        driver    = fifo_driver::type_id::create("driver", this);
+        monitor   = fifo_monitor::type_id::create("monitor", this);
+    endfunction
+
+    function void connect_phase(uvm_phase phase);
+        driver.seq_item_port.connect(sequencer.seq_item_export);
+    endfunction
+
+endclass
+
+// Environment
+class fifo_env extends uvm_env;
+
+    `uvm_component_utils(fifo_env)
+
+    fifo_agent agent;
+    fifo_scoreboard sb;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        agent = fifo_agent::type_id::create("agent", this);
+        sb    = fifo_scoreboard::type_id::create("sb", this);
+    endfunction
+
+    function void connect_phase(uvm_phase phase);
+        agent.monitor.ap.connect(sb.imp);
+    endfunction
+
+endclass
+
+// Test
+class fifo_test extends uvm_test;
+
+    `uvm_component_utils(fifo_test)
+
+    fifo_env env;
+    fifo_sequence seq;
+
+    function new(string name, uvm_component parent);
+        super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+        env = fifo_env::type_id::create("env", this);
+    endfunction
+
+    task run_phase(uvm_phase phase);
+
+        phase.raise_objection(this);
+
+        seq = fifo_sequence::type_id::create("seq");
+        seq.start(env.agent.sequencer);
+
+        #200;
+        phase.drop_objection(this);
+
+    endtask
+
+endclass
+
+//Top Module
+module top;
+
+    logic clk;
+
+    always #5 clk = ~clk;
+
+    fifo_if vif(clk);
+
+    fifo_test test;
+
+    initial begin
+        clk = 0;
+
+        uvm_config_db#(virtual fifo_if)::set(null, "*", "vif", vif);
+
+        run_test("fifo_test");
+    end
+
+endmodule
